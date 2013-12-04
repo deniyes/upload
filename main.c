@@ -387,7 +387,7 @@ int set_daemon()
     
     if (rl.rlim_max == RLIM_INFINITY)
         rl.rlim_max = 1024;
-	/*
+	
     for (i = 0; i < rl.rlim_max; i ++) 
         close(i);
     
@@ -399,7 +399,6 @@ int set_daemon()
 		fprintf(stderr, "open fd 0 1 2 fail");
 		return -1;
 	}
-	*/
 
     rl.rlim_cur = MAX_FILENO_NUM;
     rl.rlim_max = MAX_FILENO_NUM;
