@@ -14,12 +14,17 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <stdarg.h>
+#include <sys/stat.h>
 
 
 #define MAX_EVENTS_NUM   (10240)
 #define MAX_CONN_NUM     (2048)
 #define MAX_FILENO_NUM   (20480)
 #define MAX_BUF_SIZE         (4096)
+
+#define MAX_LOG_SIZE      (1024 * 1024 * 600)
+
 #define ACCESS_BUF           "quickbird_speedtest"
 #define ACCESS_BUF_LEN      (sizeof(ACCESS_BUF) - 1)
 
@@ -30,10 +35,15 @@ int UP_CHILD = 0;
 int g_cpu_num = 0;
 int g_pid_array[32] = {-1};
 
-typedef struct upload_connection_s{
+FILE *FILE_ERR = NULL;
+FILE *FILE_ACCESS = NULL;
+char *g_err_path = "/var/log/upload_error.log";
+char *g_access_path = "/var/log/upload_access.log";
+
+typedef struct upload_connection_s {
     int                 fd;
     int                 len;
-    unsigned            trans_state:1;
+    unsigned            trans_state:2;  /* 0: invalid; 1: success; 2:connection fail */
     unsigned            memory_state:1;
     char                port[8];
     char                client_ip[16];
@@ -52,6 +62,74 @@ typedef struct upload_connection_pool_s {
 upload_connection_pool_t g_connection_pool;
 
 
+int up_log_file_test(char *path, FILE **fp)
+{
+    struct stat   stat_info;
+    int            size = 0;
+    char           new_path[1024] = {0};
+    int            ret = 0;
+    FILE           *fp_new = NULL;
+
+    if (!(*fp))
+        goto AGAIN;
+
+    if (access(path, F_OK)) {
+        fclose(*fp);
+        goto AGAIN;
+    }
+    if(stat(path, &stat_info) < 0){
+        return -1;
+    } else {
+        size = stat_info.st_size;
+    }
+
+    if (size < MAX_LOG_SIZE)
+        return 0;
+
+    fclose (*fp);
+    ret = snprintf(new_path, 1024, "%s.bak", path);
+    if (ret < 0)
+        return -1;
+    if (rename(path, new_path))
+        return -1;
+
+AGAIN:
+    fp_new = fopen(path, "a");
+    if (!fp_new)
+        return -1;
+    *fp = fp_new;
+    return 0;
+}
+
+
+
+void up_log(char *path, FILE *fp, char *fmt, ...)
+{
+    time_t          s;
+    size_t          len = 0;
+    char            buf[1024];
+    char            *p = NULL;
+    va_list         args;
+
+    if (up_log_file_test(path, &fp)) {
+        return;
+    }
+
+    s = time(NULL);
+    ctime_r(&s, buf);
+
+    len = strlen(buf);
+    buf[len] = buf[len - 1] = '\t';
+
+    p = buf + len + 1;
+    va_start(args, fmt);
+    vsprintf(p, fmt, args);
+    va_end(args);
+
+    fprintf(fp, "%s.\n", buf);
+}
+
+
 int init_connection_pool()
 {
     int     i = 0;
@@ -59,7 +137,6 @@ int init_connection_pool()
 
     root = calloc(MAX_CONN_NUM, sizeof(upload_connection_t));
     if (!root) {
-        fprintf(stderr, "alloc connection pool fail.\n");
         return -1;
     }
     g_connection_pool.head = &root[0];
@@ -128,7 +205,6 @@ int add_listen_fd(int epoll_fd, int listen_fd)
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {
-                perror("accept");
                 return -1;
             }
         }
@@ -137,6 +213,7 @@ int add_listen_fd(int epoll_fd, int listen_fd)
                 , hbuf, sizeof(hbuf), pbuf, sizeof(pbuf) \
                 , NI_NUMERICHOST | NI_NUMERICSERV);
         if (ret) {
+            up_log(g_err_path, FILE_ERR, "getnameinfo fail with errno:%d", errno);
             close(connfd);
             continue;
         }
@@ -144,52 +221,52 @@ int add_listen_fd(int epoll_fd, int listen_fd)
         p_len = strlen(pbuf);
         if (h_len > 15 || p_len > 5) {
             close(connfd);
+            up_log(g_err_path, FILE_ERR, "%s", "invalid ip or port info");
             continue;
         }
         
         upload_connection_t *info = get_connection();
         if (!info) {
             close(connfd);
+            up_log(g_err_path, FILE_ERR, "%s", "get connetion fail");
             continue;
         }
         info->fd = connfd;
         gettimeofday(&(info->begin_time), NULL);
         memcpy(info->client_ip, hbuf, h_len);
         memcpy(info->port, pbuf, p_len);
-        fprintf(stdout, "add a conn!\n");
         add_epoll_fd(epoll_fd, info);
     }
     return 0;
 
 }
 
-int read_fd_data(int sockfd, void *ptr)
+int read_fd_data(upload_connection_t *s)
 {
-    
     char buf[MAX_BUF_SIZE];
-    upload_connection_t *s = ptr;
+    int  sockfd = s->fd;
     while (1) {
         int ret = read(sockfd, buf, MAX_BUF_SIZE);
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }
-            perror("read");
+            up_log(g_err_path, FILE_ERR, "read fail with errno:%d", errno);
+            s->trans_state = 2;
             return -1;
         } else if (ret == 0) {
             gettimeofday(&(s->end_time), NULL);
             fprintf(stdout, "end ip: %s port:%s diff time: %d len: %d\n", s->client_ip, s->port, 
-                          (1000000 * s->end_time.tv_sec + s->end_time.tv_usec) - 
-                          (1000000 * s->begin_time.tv_sec + s->begin_time.tv_usec), s->len);
+                           s->len);
             return 1;
         } else {
             if (s->trans_state == 0) {
                 if (ret < ACCESS_BUF_LEN) {
-                    fprintf(stderr, "invalid read data.\n");
+                    up_log(g_err_path, FILE_ERR, "%s", "invalid head len"); 
                     return -1;
                 }
                 if (memcmp(buf, ACCESS_BUF, ACCESS_BUF_LEN)) {
-                    fprintf(stderr, "invalid read data.\n");
+                    up_log(g_err_path, FILE_ERR, "%s", "invalid head data"); 
                     return -1;
                 }
                 s->trans_state = 1;
@@ -202,9 +279,10 @@ int read_fd_data(int sockfd, void *ptr)
 
 void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
 {
-    int i   = 0;
-    int ret = 0;
-    int sockfd = 0;
+    int     i   = 0;
+    int     ret = 0;
+    int     sockfd = 0;
+    double     last_time = 0;
     upload_connection_t *s = NULL;
     
     for (i = 0; i < num; i ++) {
@@ -214,18 +292,23 @@ void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
           ||(events[i].events & EPOLLHUP) \
           ||!(events[i].events & EPOLLIN))
         {
-            fprintf (stderr, "epoll error\n");
             close (sockfd);
+            up_log(g_err_path, FILE_ERR, "%s", "epoll connection error");
             free_connection(s);
             
         } else if (sockfd == listen_fd) {
             ret = add_listen_fd(epoll_fd, listen_fd);
             if (ret) {
-                fprintf(stderr, "accept fail.\n");
+                up_log(g_err_path, FILE_ERR, "accept fail with errno: %d", errno);
             }
         } else if (events[i].events & EPOLLIN) {
-            ret = read_fd_data(sockfd, events[i].data.ptr);
+            ret = read_fd_data(s);
             if (ret) {
+                last_time = (double)((1000000 * s->end_time.tv_sec + s->end_time.tv_usec) - 
+                            (1000000 * s->begin_time.tv_sec + s->begin_time.tv_usec))/1000000;
+                up_log(g_access_path, FILE_ACCESS \
+                    ,  "[%d] IP:%s PORT:%s LAST_TIME:%f LEN:%d" \
+                    , getpid(), s->client_ip, s->port, last_time, s->len);
                 close(sockfd);
                 free_connection(s);
             }
@@ -242,13 +325,13 @@ void work_process(int listen_fd)
     int epoll_fd = epoll_create(10);
     
     if (epoll_fd == -1) {
-        perror("epoll_create");
+        up_log(g_err_path, FILE_ERR, "%s", "epoll_create fail");
         exit(2);
     }
     
     upload_connection_t *info = calloc(1, sizeof(upload_connection_t));
     if (!info) {
-        fprintf(stderr, "calloc err.\n");
+        up_log(g_err_path, FILE_ERR, "%s", "calloc fail");
         exit(2);
     }
     info->fd = listen_fd;
@@ -256,7 +339,7 @@ void work_process(int listen_fd)
 
     ret = init_connection_pool();
     if (ret) {
-        fprintf(stderr, "alloc connection pool fail.\n");
+        up_log(g_err_path, FILE_ERR, "%s", "alloc connection pool fail");
         exit(2);
     }
 
@@ -281,7 +364,7 @@ int start_work_process(int listen_fd)
 {
     int	pid = fork();
     if (pid < 0)  {
-        fprintf(stderr, "create work process fail.\n");
+        up_log(g_err_path, FILE_ERR, "fork fail with errno: %d", errno); 
         return -1;
     }
     else if (pid == 0) {
@@ -325,15 +408,14 @@ void signal_worker_process(int listen_fd)
                 }
             }
             if (WTERMSIG(status)) {
-                fprintf(stderr, "process %d exit on signal %d.\n" \
+                up_log(g_err_path, FILE_ERR, "process %d exit on signal %d" \
                     , pid, WTERMSIG(status));
             } else {
-                fprintf(stderr, "process %d exit with return code %d.\n" \
+                up_log(g_err_path, FILE_ERR,  "process %d exit with return code %d" \
                     , pid, WEXITSTATUS(status));
             }
             pid = start_work_process(listen_fd);
             if (pid < 0) {
-                fprintf(stderr, "fork new process fail.\n");
                 return;
             }
             g_pid_array[i] = pid;
@@ -344,25 +426,13 @@ void signal_worker_process(int listen_fd)
 
 int set_daemon()
 {	
-	int i = 0;
-	int	pid = 0;
-	int fd = 0;
-	int fd0, fd1, fd2;
-	struct rlimit rl;
+    int i = 0;
+    int	pid = 0;
+    int fd = 0;
+    int fd0, fd1, fd2;
+    struct rlimit rl;
     struct sigaction sa;
-    
-	umask(0);
-	if (getrlimit(RLIMIT_NOFILE, &rl) < 0) {
-		fprintf(stderr, "getrlimit fail");
-        return -1;
-    }
-
-    sa.sa_handler = SIG_IGN;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    if (sigaction(SIGHUP, &sa, NULL) < 0)
-        return -1;
-    
+        
     pid = fork();
     if (pid < 0) {
 		fprintf(stderr, "fork fail");
@@ -371,17 +441,29 @@ int set_daemon()
     else if (pid > 0) {
         exit(0);    
     }
-    
     setsid();
+    
+    umask(0);
+    
+    if (getrlimit(RLIMIT_NOFILE, &rl) < 0) {
+        fprintf(stderr, "getrlimit fail");
+        return -1;
+    }
+
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGHUP, &sa, NULL) < 0)
+        return -1;
 
     sa.sa_handler = sig_chld_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     if (sigaction(SIGCHLD, &sa, NULL) < 0)
         return -1;
- 	
+
     if (chdir("/") < 0) {
-		fprintf(stderr, "chdir fail");
+		up_log(g_err_path, FILE_ERR, "%s", "chdir fail");
         return -1;
 	}
     
@@ -396,14 +478,14 @@ int set_daemon()
     fd2 = dup(0);
     
     if (fd0 != 0 || fd1 != 1 || fd2 != 2) {
-		fprintf(stderr, "open fd 0 1 2 fail");
+        up_log(g_err_path, FILE_ERR, "%s", "open fd 0 1 2 fail");
 		return -1;
 	}
 
     rl.rlim_cur = MAX_FILENO_NUM;
     rl.rlim_max = MAX_FILENO_NUM;
     if (setrlimit(RLIMIT_NOFILE, &rl) == -1) {
-        fprintf(stderr, "setrlimit fail.\n");
+        up_log(g_err_path, FILE_ERR, "%s", "setrlimit fail");
         return -1;
     }
 	return 0;
@@ -437,6 +519,15 @@ int main(int argc, char **argv)
             return -1;
         }
     }
+    FILE_ERR = fopen(g_err_path, "a");
+    if (!FILE_ERR) {
+        return -1;
+    }
+    FILE_ACCESS = fopen(g_access_path, "a");
+    if (!FILE_ACCESS) {
+        up_log(g_err_path, FILE_ERR, "%s", "fopen access log fail");
+        return -1;
+    }
     
     sigset_t	mask;
     sigemptyset(&mask);
@@ -457,23 +548,26 @@ int main(int argc, char **argv)
     int flg = 1;
     ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &flg, sizeof(flg));
     if (ret == -1) {
-        perror("setsockopt");
+        up_log(g_err_path, FILE_ERR, "setsockopt fail with errno: %d", errno);
         return -1;
     }
 
     ret = bind(listen_fd, (struct sockaddr*)&server, sizeof(server));
     if (ret == -1) {
-        perror("bind");
+        up_log(g_err_path, FILE_ERR, "bind fail with errno: %d", errno);
         return -1;
     }
 
     ret = listen(listen_fd, SOMAXCONN);
     if (ret == -1) {
-        perror("listen");
+        up_log(g_err_path, FILE_ERR, "listen fail with errno: %d", errno);
         return -1;
     }
 
     g_cpu_num = sysconf(_SC_NPROCESSORS_ONLN);
+    if (g_cpu_num == -1) {
+        g_cpu_num = 1;
+    }
 
     for (i = 0; i < g_cpu_num; i ++) {
         int pid = start_work_process(listen_fd);
