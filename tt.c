@@ -10,6 +10,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <sys/resource.h>
+#include <signal.h>
 
 
 #define MAX_EVENTS_NUMBER   (1024)
@@ -20,6 +22,10 @@
 
 #define set_nonblocking(fd)  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
 
+int UP_EXITED = 0;
+int UP_CHILD = 0;
+int PORT = 0;
+int PID = 0;
 
 
 typedef struct upload_connection_s{
@@ -166,27 +172,98 @@ void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
 }
 
 
-int main(int argc, char **argv) 
+void sig_chld_handler(int signo)
 {
-    char c = 0;
+    UP_CHILD = 1;
+}
 
-    unsigned short port = 0;
-    while ((c = getopt(argc, argv, "p:")) != -1) {
-        switch (c) {
-            case 'p':
-                port = atoi(optarg);
-                break;
+
+void signal_worker_process(int pid, int (*func)(void)) 
+{
+    int 	status = 0;
+    int 	ret		= 0;
+    if (UP_CHILD) {
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            UP_EXITED = 1;
+            return;
         }
+        sleep(1);
+        printf("re.\n");
+        func();
+    } 	
+}
+
+
+int set_daemon()
+{	
+	int i = 0;
+	int	pid = 0;
+	int fd = 0;
+	int fd0, fd1, fd2;
+	struct rlimit rl;
+    struct sigaction sa;
+    
+	umask(0);
+	if (getrlimit(RLIMIT_NOFILE, &rl) < 0) {
+		fprintf(stderr, "getrlimit fail");
+        return -1;
     }
 
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGHUP, &sa, NULL) < 0)
+        return -1;
+    
+    pid = fork();
+    if (pid < 0) {
+		fprintf(stderr, "fork fail");
+        return -1;
+    }
+    else if (pid > 0) {
+        exit(0);    
+    }
+    
+    setsid();
 
+    sa.sa_handler = sig_chld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGCHLD, &sa, NULL) < 0)
+        return -1;
+ 	
+    if (chdir("/") < 0) {
+		fprintf(stderr, "chdir fail");
+        return -1;
+	}
+    
+    if (rl.rlim_max == RLIM_INFINITY)
+        rl.rlim_max = 1024;
+	
+    for (i = 0; i < rl.rlim_max; i ++) 
+        close(i);
+    
+    fd0 = open("/dev/null", O_RDWR);
+    fd1 = dup(0);
+    fd2 = dup(0);
+    
+    if (fd0 != 0 || fd1 != 1 || fd2 != 2) {
+		fprintf(stderr, "open fd 0 1 2 fail");
+		return -1;
+	}
+	return 0;
+	
+}
+
+int work_process()
+{
     int ret = 0;
     struct sockaddr_in server;
     bzero(&server, sizeof(server));
     server.sin_family = AF_INET;
     server.sin_addr.s_addr = htonl(INADDR_ANY);
-    server.sin_port = htons(port);
-
+    server.sin_port = htons(PORT);
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         return -1;
@@ -220,10 +297,9 @@ int main(int argc, char **argv)
     upload_connection_t *info = calloc(1, sizeof(upload_connection_t));
     if (!info) {
         fprintf(stderr, "calloc err.\n");
-        return;
+        return -1;
     }
     info->fd = listen_fd;
-    
     add_epoll_fd(epoll_fd, info);
 
     while (1) {
@@ -236,8 +312,73 @@ int main(int argc, char **argv)
         }
         et(events, ret, epoll_fd, listen_fd);
     }
+    
     close(listen_fd);
     close(epoll_fd);
     free(info);
     return 0;
 }
+
+int start_work_process()
+{
+    int	pid = fork();
+    if (pid < 0)  {
+        fprintf(stderr, "create work process fail.\n");
+        return -1;
+    }
+    else if (pid == 0) {
+        work_process();
+    } 
+    PID = pid;
+    return pid;
+}
+
+
+int main(int argc, char **argv) 
+{
+    char        c = 0;
+    int         daemon = 0;
+    while ((c = getopt(argc, argv, "p:d")) != -1) {
+        switch (c) {
+            case 'p':
+                PORT = atoi(optarg);
+                break;
+            case 'd':
+                daemon = 1;
+                break;
+        }
+    }
+    if (!PORT) {
+        fprintf(stderr, "invalid port.\n");
+        return -1;
+    }
+    if (daemon) {
+        if (set_daemon()) {
+            fprintf(stderr, "set daemon fail.\n");
+            return -1;
+        }
+    }
+    
+    sigset_t	mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+        return -1;
+    }
+	
+    sigemptyset(&mask);
+    int pid = start_work_process();
+    if (pid < 0) {
+        return -1;
+    }
+	
+    for (;;) {
+        if (UP_EXITED) 
+            break;
+		
+        sigsuspend(&mask); 
+        signal_worker_process(PID, start_work_process);
+    }
+    return 0;
+}
+
