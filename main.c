@@ -127,6 +127,7 @@ void up_log(char *path, FILE *fp, char *fmt, ...)
     va_end(args);
 
     fprintf(fp, "%s.\n", buf);
+    fflush(fp);
 }
 
 
