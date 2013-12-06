@@ -156,6 +156,8 @@ upload_connection_t* get_connection()
         p = g_connection_pool.head;
         g_connection_pool.head = p->next;
         g_connection_pool.free_num --;
+        if (!g_connection_pool.free_num) 
+            g_connection_pool.tail = NULL;
     } else {
         p = calloc(1, sizeof(upload_connection_t));
         if (!p) {
@@ -174,8 +176,13 @@ void free_connection(upload_connection_t *p)
         return;
     }
     memset(p, 0, sizeof(upload_connection_t));
-    g_connection_pool.tail->next = p;
-    g_connection_pool.tail = p;
+    if (g_connection_pool.free_num) { 
+        g_connection_pool.tail->next = p;
+        g_connection_pool.tail = p;
+    } else {
+        g_connection_pool.head = p;
+        g_connection_pool.tail = p;
+    }
     g_connection_pool.free_num ++;
 }
 
@@ -563,6 +570,11 @@ int main(int argc, char **argv)
     if (ret == -1) {
         up_log(g_err_path, FILE_ERR, "listen fail with errno: %d", errno);
         return -1;
+    }
+
+    if (!daemon) {
+        work_process(listen_fd);
+        return 0;
     }
 
     g_cpu_num = sysconf(_SC_NPROCESSORS_ONLN);
