@@ -16,12 +16,15 @@
 #include <sys/wait.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 
 
 #define MAX_EVENTS_NUM   (10240)
-#define MAX_CONN_NUM     (2048)
-#define MAX_FILENO_NUM   (20480)
-#define MAX_BUF_SIZE         (4096)
+#define MAX_CONN_NUM     (4096)
+#define MAX_FILENO_NUM   (11264)
+#define MAX_READBUF_SIZE (64 * 1024)
+#define MAX_RCVBUF_SIZE  (128 * 1024)
 
 #define MAX_LOG_SIZE      (1024 * 1024 * 600)
 
@@ -251,10 +254,10 @@ int add_listen_fd(int epoll_fd, int listen_fd)
 
 int read_fd_data(upload_connection_t *s)
 {
-    char buf[MAX_BUF_SIZE];
+    char buf[MAX_READBUF_SIZE];
     int  sockfd = s->fd;
     while (1) {
-        int ret = read(sockfd, buf, MAX_BUF_SIZE);
+        int ret = read(sockfd, buf, MAX_READBUF_SIZE);
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -264,7 +267,7 @@ int read_fd_data(upload_connection_t *s)
             return -1;
         } else if (ret == 0) {
             gettimeofday(&(s->end_time), NULL);
-            fprintf(stdout, "end ip: %s port:%s diff time: %d len: %d\n", s->client_ip, s->port, 
+            fprintf(stdout, "end ip: %s port:%s len: %d\n", s->client_ip, s->port, 
                            s->len);
             return 1;
         } else {
@@ -315,8 +318,8 @@ void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
                 last_time = (double)((1000000 * s->end_time.tv_sec + s->end_time.tv_usec) - 
                             (1000000 * s->begin_time.tv_sec + s->begin_time.tv_usec))/1000000;
                 up_log(g_access_path, FILE_ACCESS \
-                    ,  "[%d] IP:%s PORT:%s LAST_TIME:%f LEN:%d" \
-                    , getpid(), s->client_ip, s->port, last_time, s->len);
+                    ,  "[%d] IP:%s PORT:%s LAST_TIME:%f LEN:%d STATUS:%d" \
+                    , getpid(), s->client_ip, s->port, last_time, s->len, s->trans_state);
                 close(sockfd);
                 free_connection(s);
             }
@@ -436,7 +439,6 @@ int set_daemon()
 {	
     int i = 0;
     int	pid = 0;
-    int fd = 0;
     int fd0, fd1, fd2;
     struct rlimit rl;
     struct sigaction sa;
@@ -556,17 +558,24 @@ int main(int argc, char **argv)
     int flg = 1;
     ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &flg, sizeof(flg));
     if (ret == -1) {
-        up_log(g_err_path, FILE_ERR, "setsockopt fail with errno: %d", errno);
+        up_log(g_err_path, FILE_ERR, "setsockopt reuseaddr fail with errno: %d", errno);
         return -1;
     }
-
+    
+    flg = MAX_RCVBUF_SIZE;
+    ret = setsockopt(listen_fd, SOL_SOCKET, SO_RCVBUF, &flg, sizeof(flg));
+    if (ret == -1) {
+        up_log(g_err_path, FILE_ERR, "setsockopt recvbuf fail with errno: %d", errno);
+        return -1;
+    }
+    
     ret = bind(listen_fd, (struct sockaddr*)&server, sizeof(server));
     if (ret == -1) {
         up_log(g_err_path, FILE_ERR, "bind fail with errno: %d", errno);
         return -1;
     }
 
-    ret = listen(listen_fd, SOMAXCONN);
+    ret = listen(listen_fd, 2048);
     if (ret == -1) {
         up_log(g_err_path, FILE_ERR, "listen fail with errno: %d", errno);
         return -1;
