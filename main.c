@@ -15,16 +15,18 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
+#include "rbtree.h"
 
 
 #define MAX_EVENTS_NUM   (10240)
 #define MAX_CONN_NUM     (4096)
 #define MAX_FILENO_NUM   (11264)
 #define MAX_READBUF_SIZE (64 * 1024)
-#define MAX_RCVBUF_SIZE  (128 * 1024)
+#define MAX_RCVBUF_SIZE  (228 * 1024)
 
 #define MAX_LOG_SIZE      (1024 * 1024 * 600)
 
@@ -32,6 +34,11 @@
 #define ACCESS_BUF_LEN      (sizeof(ACCESS_BUF) - 1)
 
 #define set_nonblocking(fd)  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+
+#define MAX_CONNECT_TIMEOUT  (300 * 1000)
+#define MAX_READ_TIMEOUT     (120 * 1000)
+rbtree_t g_rbtree;
+
 
 int UP_CHILD = 0;
 
@@ -52,6 +59,7 @@ typedef struct upload_connection_s {
     char                client_ip[16];
     struct timeval     begin_time;
     struct timeval     end_time;
+    rbtree_node_t       rbtree_node;
     struct upload_connection_s *next;
 }upload_connection_t;
 
@@ -64,6 +72,7 @@ typedef struct upload_connection_pool_s {
 
 upload_connection_pool_t g_connection_pool;
 
+rbtree_node_t g_rbtree_sentinel;
 
 int up_log_file_test(char *path, FILE **fp)
 {
@@ -189,6 +198,21 @@ void free_connection(upload_connection_t *p)
     g_connection_pool.free_num ++;
 }
 
+rbtree_key_t get_time()
+{
+    struct timeval t;
+    time_t           sec;
+    uintptr_t       msec;
+    
+    gettimeofday(&t, NULL);
+    sec = t.tv_sec;
+    msec = t.tv_usec / 1000;
+
+    return sec * 1000 + msec;
+}
+
+
+
 void add_epoll_fd(int epoll_fd, upload_connection_t *info) 
 {
     struct epoll_event event;
@@ -246,6 +270,8 @@ int add_listen_fd(int epoll_fd, int listen_fd)
         gettimeofday(&(info->begin_time), NULL);
         memcpy(info->client_ip, hbuf, h_len);
         memcpy(info->port, pbuf, p_len);
+        info->rbtree_node.key = get_time()+ MAX_CONNECT_TIMEOUT;
+        rbtree_insert(&g_rbtree, &(info->rbtree_node));
         add_epoll_fd(epoll_fd, info);
     }
     return 0;
@@ -267,8 +293,6 @@ int read_fd_data(upload_connection_t *s)
             return -1;
         } else if (ret == 0) {
             gettimeofday(&(s->end_time), NULL);
-            fprintf(stdout, "end ip: %s port:%s len: %d\n", s->client_ip, s->port, 
-                           s->len);
             return 1;
         } else {
             if (s->trans_state == 0) {
@@ -288,6 +312,39 @@ int read_fd_data(upload_connection_t *s)
     return 0;
 }
 
+
+
+void
+event_expire_timers(void)
+{
+    upload_connection_t        *s;
+    rbtree_node_t  *node, *root, *sentinel;
+
+    sentinel = g_rbtree.sentinel;
+
+    for ( ;; ) {
+        root = g_rbtree.root;
+        if (root == sentinel) {
+            return;
+        }
+
+        node = rbtree_min(root, sentinel);
+
+        if (((rbtree_key_int_t)(node->key - get_time())) <= 0) {
+            s = (upload_connection_t *) ((char *) node - offsetof(upload_connection_t, rbtree_node));
+
+            rbtree_delete(&g_rbtree, &s->rbtree_node);
+            close(s->fd);
+            up_log(g_err_path, FILE_ERR, "%s", "epoll connection timeout");
+            free_connection(s);
+            continue;
+        }
+
+        break;
+    }
+
+}
+
 void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
 {
     int     i   = 0;
@@ -303,6 +360,7 @@ void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
           ||(events[i].events & EPOLLHUP) \
           ||!(events[i].events & EPOLLIN))
         {
+            rbtree_delete(&g_rbtree, &(s->rbtree_node));
             close (sockfd);
             up_log(g_err_path, FILE_ERR, "%s", "epoll connection error");
             free_connection(s);
@@ -315,6 +373,7 @@ void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
         } else if (events[i].events & EPOLLIN) {
             ret = read_fd_data(s);
             if (ret) {
+                rbtree_delete(&g_rbtree, &(s->rbtree_node));
                 last_time = (double)((1000000 * s->end_time.tv_sec + s->end_time.tv_usec) - 
                             (1000000 * s->begin_time.tv_sec + s->begin_time.tv_usec))/1000000;
                 up_log(g_access_path, FILE_ACCESS \
@@ -322,6 +381,10 @@ void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
                     , getpid(), s->client_ip, s->port, last_time, s->len, s->trans_state);
                 close(sockfd);
                 free_connection(s);
+            } else {     
+                rbtree_delete(&g_rbtree, &(s->rbtree_node));
+                s->rbtree_node.key = get_time() + MAX_READ_TIMEOUT;
+                rbtree_insert(&g_rbtree, &(s->rbtree_node)); 
             }
         } 
     }
@@ -332,6 +395,9 @@ void et(struct epoll_event *events, int num, int epoll_fd, int listen_fd)
 void work_process(int listen_fd)
 {
     int             ret = 0;
+    rbtree_key_int_t    timeout = -1;
+    rbtree_node_t       *p = NULL;
+    rbtree_key_t        now, after;
     struct epoll_event events[MAX_EVENTS_NUM];
     int epoll_fd = epoll_create(10);
     
@@ -355,7 +421,18 @@ void work_process(int listen_fd)
     }
 
     while (1) {
-        ret = epoll_wait(epoll_fd, events, MAX_EVENTS_NUM, -1);
+        now = get_time();
+        /*假如红黑树里没有节点，则超时时间设置为-1*/
+        if (g_rbtree.root == &g_rbtree_sentinel) {
+            timeout = -1;
+        } else {  
+            /* 假如最小时间的超时时间已经到达，则设置立即返回*/
+            p = rbtree_min(g_rbtree.root, g_rbtree.sentinel);
+            timeout = (rbtree_key_int_t)(p->key - now);
+            timeout = timeout > 0? timeout : 0;
+        }
+        
+        ret = epoll_wait(epoll_fd, events, MAX_EVENTS_NUM, timeout);
         if (ret < 0) {
             if (ret == EINTR) {
                 continue;
@@ -363,6 +440,10 @@ void work_process(int listen_fd)
             break;
         }
         et(events, ret, epoll_fd, listen_fd);
+        after = get_time();
+        if ((rbtree_key_int_t)(after - now)) {
+            event_expire_timers();
+        }
     }
     
     close(listen_fd);
@@ -555,20 +636,30 @@ int main(int argc, char **argv)
     if (listen_fd < 0) {
         return -1;
     }
+    
     int flg = 1;
     ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &flg, sizeof(flg));
     if (ret == -1) {
         up_log(g_err_path, FILE_ERR, "setsockopt reuseaddr fail with errno: %d", errno);
         return -1;
     }
-    
+
+    struct linger so_linger;
+    so_linger.l_onoff = 1;
+    so_linger.l_linger = 0;
+    ret = setsockopt(listen_fd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+    if (ret == -1) {
+        up_log(g_err_path, FILE_ERR, "setsockopt reuseaddr fail with errno: %d", errno);
+        return -1;
+    }
+   
     flg = MAX_RCVBUF_SIZE;
     ret = setsockopt(listen_fd, SOL_SOCKET, SO_RCVBUF, &flg, sizeof(flg));
     if (ret == -1) {
         up_log(g_err_path, FILE_ERR, "setsockopt recvbuf fail with errno: %d", errno);
         return -1;
     }
-    
+ 
     ret = bind(listen_fd, (struct sockaddr*)&server, sizeof(server));
     if (ret == -1) {
         up_log(g_err_path, FILE_ERR, "bind fail with errno: %d", errno);
@@ -580,6 +671,8 @@ int main(int argc, char **argv)
         up_log(g_err_path, FILE_ERR, "listen fail with errno: %d", errno);
         return -1;
     }
+
+    rbtree_init(&g_rbtree, & g_rbtree_sentinel);
 
     if (!daemon) {
         work_process(listen_fd);
