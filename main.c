@@ -233,7 +233,6 @@ int add_listen_fd(int epoll_fd, int listen_fd)
     int  h_len = 0;
     int  p_len = 0;
     int  ret = 0;
-
     for( ;; ) {
         int connfd = accept(listen_fd, (struct sockaddr*)&client_address, &len);
         if (connfd == -1) {
@@ -329,7 +328,6 @@ event_expire_timers(void)
         }
 
         node = rbtree_min(root, sentinel);
-
         if (((rbtree_key_int_t)(node->key - get_time())) <= 0) {
             s = (upload_connection_t *) ((char *) node - offsetof(upload_connection_t, rbtree_node));
             s->trans_state = 3;
@@ -433,7 +431,6 @@ void work_process(int listen_fd)
             timeout = (rbtree_key_int_t)(p->key - now);
             timeout = timeout > 0 ? timeout : 0;
         }
-        
         ret = epoll_wait(epoll_fd, events, MAX_EVENTS_NUM, timeout);
         if (ret < 0) {
             if (ret == EINTR) {
